@@ -144,14 +144,30 @@ def _gps_join(ticc: pd.DataFrame,
     top_q  = top_df.set_index("tow_s")["qerr_ps"]   if not top_df.empty else pd.Series(dtype=float)
     bot_q  = bot_df.set_index("tow_s")["qerr_ps"]   if not bot_df.empty else pd.Series(dtype=float)
     top_ts = top_df.set_index("tow_s")["timestamp"]  if not top_df.empty else pd.Series(dtype=object)
+    bot_ts = bot_df.set_index("tow_s")["timestamp"]  if not bot_df.empty else pd.Series(dtype=object)
 
     # tow_s = GPS_second − 1 is the TIM-TP that predicted this PPS edge
     corr_tow = df["gps_sec"] - 1
-    df["qerr_top_ps"] = corr_tow.map(top_q)   if not top_q.empty  else np.nan
-    df["qerr_bot_ps"] = corr_tow.map(bot_q)   if not bot_q.empty  else np.nan
-    df["utc_time"]    = corr_tow.map(top_ts)  if not top_ts.empty else pd.NaT
 
-    return df.dropna(subset=["qerr_top_ps", "qerr_bot_ps"]).reset_index(drop=True)
+    # When a source is absent, use 0 (no correction) rather than NaN.
+    # Only drop rows where an *available* source has no matching entry.
+    df["qerr_top_ps"] = corr_tow.map(top_q) if not top_q.empty else 0
+    df["qerr_bot_ps"] = corr_tow.map(bot_q) if not bot_q.empty else 0
+
+    # UTC wall-clock: prefer TOP (F10T), fall back to BOT (PX1125T)
+    if not top_ts.empty:
+        df["utc_time"] = corr_tow.map(top_ts)
+    elif not bot_ts.empty:
+        df["utc_time"] = corr_tow.map(bot_ts)
+    else:
+        df["utc_time"] = pd.NaT
+
+    drop_cols = ([("qerr_top_ps",)] if not top_q.empty else []) + \
+                ([("qerr_bot_ps",)] if not bot_q.empty else [])
+    drop_cols = [c for tup in drop_cols for c in tup]
+    if drop_cols:
+        df = df.dropna(subset=drop_cols)
+    return df.reset_index(drop=True)
 
 
 # ── qErr alignment validation ────────────────────────────────────────── #
@@ -176,10 +192,14 @@ def validate_alignment(ticc: pd.DataFrame,
     bot = timtp.get("BOT", pd.DataFrame(columns=["qerr_ps", "tow_s"]))
     raw_std_ns = float(ticc["raw_diff_s"].dropna().std() * 1e9)
 
-    if top.empty or bot.empty:
+    if top.empty and bot.empty:
         return raw_std_ns, [], 0
 
-    naive = int(top["tow_s"].iloc[0]) - int(ticc["integer_sec"].iloc[0])
+    # GPS offset: prefer TOP (F10T) as reference, fall back to BOT (PX1125T)
+    if not top.empty:
+        naive = int(top["tow_s"].iloc[0]) - int(ticc["integer_sec"].iloc[0])
+    else:
+        naive = int(bot["tow_s"].iloc[0]) - int(ticc["integer_sec"].iloc[0])
 
     results = []
     for delta in (-1, 0, +1, +2):
@@ -222,9 +242,12 @@ def apply_qerr(ticc: pd.DataFrame,
     # No qErr available: return raw pairs with synthetic relative time axis.
     if top.empty and bot.empty:
         df = ticc.copy()
-        df["corr_diff_s"] = df["raw_diff_s"]
         df["qerr_top_ps"] = 0
         df["qerr_bot_ps"] = 0
+        df["chA_corr_ts"] = df["chA_ts"]
+        df["chB_corr_ts"] = df["chB_ts"]
+        df["corr_diff_s"] = df["raw_diff_s"]
+        df["_sign"] = sign
         # Synthesise a UTC-like time from integer_sec (arbitrary epoch).
         t0 = pd.Timestamp("1970-01-01", tz="UTC") + \
              pd.to_timedelta(df["integer_sec"].iloc[0], unit="s")
@@ -234,10 +257,10 @@ def apply_qerr(ticc: pd.DataFrame,
         return df
 
     df = _gps_join(ticc, top, bot, gps_offset)
-    df["corr_diff_s"] = (
-        (df["chA_ts"] + sign * df["qerr_top_ps"] * 1e-12) -
-        (df["chB_ts"] + sign * df["qerr_bot_ps"] * 1e-12)
-    )
+    df["chA_corr_ts"] = df["chA_ts"] + sign * df["qerr_top_ps"] * 1e-12
+    df["chB_corr_ts"] = df["chB_ts"] + sign * df["qerr_bot_ps"] * 1e-12
+    df["corr_diff_s"] = df["chA_corr_ts"] - df["chB_corr_ts"]
+    df["_sign"] = sign   # carry sign through for reporting
     return df
 
 
@@ -253,24 +276,108 @@ def compute_stability(phase_s: np.ndarray) -> dict:
     if len(phase_s) < 8:
         return {}
     taus_a, adev, _, _ = allantools.adev(
-        phase_s, rate=1.0, data_type="phase", taus="decade")
+        phase_s, rate=1.0, data_type="phase", taus="all")
     taus_t, tdev, _, _ = allantools.tdev(
-        phase_s, rate=1.0, data_type="phase", taus="decade")
+        phase_s, rate=1.0, data_type="phase", taus="all")
     return {"taus_adev": taus_a, "adev": adev,
             "taus_tdev": taus_t, "tdev": tdev}
 
 
+def individual_stability(df: pd.DataFrame) -> dict[str, dict]:
+    """
+    Compute ADEV/TDEV for each PPS channel individually and for the difference.
+
+    Individual phase series:  x[i] = ts[i] - ts[0] - i
+      (deviation from ideal integer-second cadence, anchored at the first edge)
+    The TICC clock's linear drift cancels out in the A-B difference;
+    it appears in both individual series but is common-mode.
+
+    Returns dict with keys 'chA_raw', 'chA_corr', 'chB_raw', 'chB_corr',
+    'diff_raw', 'diff_corr', each a stability dict from compute_stability()
+    (may be empty if data is too short or qErr unavailable).
+    """
+    def _phase(ts: np.ndarray) -> np.ndarray:
+        """Phase residual relative to ideal 1-Hz cadence."""
+        return ts - ts[0] - np.arange(len(ts))
+
+    chA_raw  = df["chA_ts"].values
+    chB_raw  = df["chB_ts"].values
+    chA_corr = df["chA_corr_ts"].values
+    chB_corr = df["chB_corr_ts"].values
+
+    return {
+        "chA_raw":  compute_stability(_phase(chA_raw)),
+        "chA_corr": compute_stability(_phase(chA_corr)),
+        "chB_raw":  compute_stability(_phase(chB_raw)),
+        "chB_corr": compute_stability(_phase(chB_corr)),
+        "diff_raw":  compute_stability(df["raw_diff_s"].values),
+        "diff_corr": compute_stability(df["corr_diff_s"].values),
+    }
+
+
 # ── report ───────────────────────────────────────────────────────────── #
 
+def _stab_rows(stab: dict, key_taus: list[int]) -> list[tuple]:
+    """Return (tau, adev, tdev) rows for the given key taus, or empty list."""
+    if not stab:
+        return []
+    rows = []
+    for tau in key_taus:
+        ia = np.searchsorted(stab["taus_adev"], tau)
+        it = np.searchsorted(stab["taus_tdev"], tau)
+        adev = stab["adev"][ia] if ia < len(stab["adev"]) else None
+        tdev = stab["tdev"][it] * 1e9 if it < len(stab["tdev"]) else None
+        rows.append((tau, adev, tdev))
+    return rows
+
+
+def _stab_section(a, header: str, raw: dict, corr: dict, key_taus: list[int],
+                  has_corr: bool) -> None:
+    """Append a combined ADEV/TDEV section (raw + optionally corrected)."""
+    a(header)
+    # Header row
+    if has_corr:
+        a(f"  {'τ (s)':>6s}  {'ADEV raw':>11s}  {'ADEV corr':>11s}"
+          f"  {'TDEV raw (ns)':>13s}  {'TDEV corr (ns)':>14s}")
+    else:
+        a(f"  {'τ (s)':>6s}  {'ADEV':>11s}  {'TDEV (ns)':>12s}")
+    raw_rows  = _stab_rows(raw,  key_taus)
+    corr_rows = _stab_rows(corr, key_taus)
+    for i, (tau, adev_r, tdev_r) in enumerate(raw_rows):
+        if has_corr and i < len(corr_rows):
+            _, adev_c, tdev_c = corr_rows[i]
+            adev_r_s = f"{adev_r:.3e}" if adev_r is not None else "  —"
+            adev_c_s = f"{adev_c:.3e}" if adev_c is not None else "  —"
+            tdev_r_s = f"{tdev_r:.3f}"  if tdev_r is not None else "  —"
+            tdev_c_s = f"{tdev_c:.3f}"  if tdev_c is not None else "  —"
+            a(f"  {tau:>6d}  {adev_r_s:>11s}  {adev_c_s:>11s}"
+              f"  {tdev_r_s:>13s}  {tdev_c_s:>14s}")
+        else:
+            adev_s = f"{adev_r:.3e}" if adev_r is not None else "  —"
+            tdev_s = f"{tdev_r:.3f}"  if tdev_r is not None else "  —"
+            a(f"  {tau:>6d}  {adev_s:>11s}  {tdev_s:>12s}")
+    a("")
+
+
 def write_report(df: pd.DataFrame,
-                 raw_stab: dict, corr_stab: dict,
+                 indiv: dict[str, dict],
                  alignment: tuple, out_stem: Path) -> None:
+    """
+    Write the PPS timing report.
+
+    indiv keys: 'chA_raw', 'chA_corr', 'chB_raw', 'chB_corr',
+                'diff_raw', 'diff_corr'
+
+    ADEV is reported as dimensionless σ_y (e.g. 9.5e-9).
+    TDEV is reported in nanoseconds (σ_x × 1e9).
+    """
     lines = []
     a = lines.append
 
     raw_ns  = df["raw_diff_s"]  * 1e9
     corr_ns = df["corr_diff_s"] * 1e9
     dur_h   = (df["utc_time"].max() - df["utc_time"].min()).total_seconds() / 3600
+    has_corr = not (df["qerr_top_ps"] == 0).all() or not (df["qerr_bot_ps"] == 0).all()
 
     a("=" * 62)
     a("  px1125t_eval PPS / TICC report  (chA=F10T, chB=PX1125T)")
@@ -279,10 +386,11 @@ def write_report(df: pd.DataFrame,
     a(f"  End      : {df['utc_time'].max()}")
     a(f"  Duration : {dur_h:.2f} h")
     a(f"  Pairs    : {len(df)}  (chA=F10T, chB=PX1125T)")
+    a(f"  qErr     : {'applied' if has_corr else 'not available (raw only)'}")
     a("")
 
     raw_std_ns, align_results, naive_offset = alignment
-    best = min(align_results, key=lambda x: x[2])
+    best = min(align_results, key=lambda x: x[2]) if align_results else None
     a("── qErr alignment check (GPS offset delta from naive, sign) ──────")
     a(f"  {'GPS Δ':>6s}  {'Sign':>5s}  {'N pairs':>7s}  {'std (ns)':>10s}")
     a(f"  {'(raw)':>6s}  {'':>5s}  {'':>7s}  {raw_std_ns:>10.3f}")
@@ -290,48 +398,34 @@ def write_report(df: pd.DataFrame,
         tags = []
         if delta == 0 and sign == +1:
             tags.append("← naive")
-        if delta == best[0] and sign == best[1]:
+        if best and delta == best[0] and sign == best[1]:
             tags.append("← best")
         tag = "  " + " ".join(tags) if tags else ""
         a(f"  {delta:>+6d}  {sign:>+5d}  {n_pairs:>7d}  {std_ns:>10.3f}{tag}")
-    if best[0] != 0 or best[1] != +1:
+    if best and (best[0] != 0 or best[1] != +1):
         a(f"  *** GPS offset delta={best[0]:+d} sign={best[1]:+d} "
           f"(GPS offset={naive_offset + best[0]}) ***")
     a("")
 
-    a("── Raw A−B difference (chA − chB) ───────────────────────")
-    a(f"  Mean : {raw_ns.mean():+.3f} ns")
-    a(f"  Std  : {raw_ns.std():.3f} ns")
-    a("")
-
-    a("── qErr-corrected A−B difference ────────────────────────")
-    a(f"  Mean : {corr_ns.mean():+.3f} ns")
-    a(f"  Std  : {corr_ns.std():.3f} ns")
+    a("── A−B difference (chA − chB) ───────────────────────────")
+    a(f"  Raw  mean : {raw_ns.mean():+.3f} ns     std : {raw_ns.std():.3f} ns")
+    if has_corr:
+        a(f"  Corr mean : {corr_ns.mean():+.3f} ns     std : {corr_ns.std():.3f} ns")
     a("")
 
     key_taus = [1, 10, 100, 1000]
+    note = ("  ADEV: dimensionless Allan deviation σ_y(τ)  [standard form, no units]\n"
+            "  TDEV: time deviation σ_x(τ), directly computed from phase series, in nanoseconds\n"
+            "        (measures RMS timing uncertainty at averaging time τ)")
+    a(note)
+    a("")
 
-    for label, stab in [("Raw", raw_stab), ("Corrected", corr_stab)]:
-        if not stab:
-            continue
-        a(f"── ADEV(τ) — {label} ─────────────────────────────────────")
-        a(f"  {'τ (s)':>8s}  {'ADEV (ns)':>12s}")
-        for tau in key_taus:
-            idx = np.searchsorted(stab["taus_adev"], tau)
-            if idx < len(stab["adev"]):
-                a(f"  {tau:>8d}  {stab['adev'][idx]*1e9:>12.3f}")
-        a("")
-
-    for label, stab in [("Raw", raw_stab), ("Corrected", corr_stab)]:
-        if not stab:
-            continue
-        a(f"── TDEV(τ) — {label} ─────────────────────────────────────")
-        a(f"  {'τ (s)':>8s}  {'TDEV (ns)':>12s}")
-        for tau in key_taus:
-            idx = np.searchsorted(stab["taus_tdev"], tau)
-            if idx < len(stab["tdev"]):
-                a(f"  {tau:>8d}  {stab['tdev'][idx]*1e9:>12.3f}")
-        a("")
+    _stab_section(a, "── chA (F10T) individual PPS stability ──────────────────",
+                  indiv["chA_raw"], indiv["chA_corr"], key_taus, has_corr)
+    _stab_section(a, "── chB (PX1125T) individual PPS stability ───────────────",
+                  indiv["chB_raw"], indiv["chB_corr"], key_taus, has_corr)
+    _stab_section(a, "── A−B differential stability (agreement) ───────────────",
+                  indiv["diff_raw"], indiv["diff_corr"], key_taus, has_corr)
 
     a("=" * 62)
 
@@ -378,18 +472,18 @@ def plot_diff(df: pd.DataFrame, out_stem: Path) -> None:
     print(f"Plot    → {path}")
 
 
-def _stability_plot(raw_stab: dict, corr_stab: dict,
-                    key: str, ylabel: str, title: str,
-                    out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(9, 5))
-    if raw_stab:
-        ax.loglog(raw_stab[f"taus_{key}"], raw_stab[key] * 1e9,
-                  color="steelblue", linewidth=1.2, label="raw")
-    if corr_stab:
-        ax.loglog(corr_stab[f"taus_{key}"], corr_stab[key] * 1e9,
-                  color="tomato", linewidth=1.2, label="qErr-corrected")
+def _stability_plot(curves: list[tuple[str, str, str, np.ndarray, np.ndarray]],
+                    ylabel: str, title: str, out_path: Path) -> None:
+    """
+    curves: list of (label, color, linestyle, taus, values)
+    """
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for label, color, ls, taus, vals in curves:
+        if taus is not None and len(taus) > 0:
+            ax.loglog(taus, vals, color=color, linestyle=ls,
+                      linewidth=1.2, label=label)
     ax.set_xlabel("τ (s)")
-    ax.set_ylabel(f"{ylabel} (ns)")
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.legend(fontsize=9)
     ax.grid(True, which="both", alpha=0.3)
@@ -399,20 +493,60 @@ def _stability_plot(raw_stab: dict, corr_stab: dict,
     print(f"Plot    → {out_path}")
 
 
-def plot_adev(raw_stab: dict, corr_stab: dict, out_stem: Path) -> None:
+def plot_adev(indiv: dict[str, dict], out_stem: Path) -> None:
+    """
+    ADEV plot: all three series (chA, chB, diff) raw and corrected.
+    Y axis: dimensionless σ_y (no unit scaling).
+    """
+    def _curve(key, label, color, ls):
+        stab = indiv.get(key, {})
+        if stab:
+            return (label, color, ls, stab["taus_adev"], stab["adev"])
+        return None
+
+    curves = [c for c in [
+        _curve("chA_raw",  "chA (F10T) raw",       "steelblue", "-"),
+        _curve("chA_corr", "chA (F10T) corrected",  "steelblue", "--"),
+        _curve("chB_raw",  "chB (PX1125T) raw",     "tomato",    "-"),
+        _curve("chB_corr", "chB (PX1125T) corrected","tomato",   "--"),
+        _curve("diff_raw", "A−B raw",               "seagreen",  "-"),
+        _curve("diff_corr","A−B corrected",          "seagreen",  "--"),
+    ] if c is not None]
+
     _stability_plot(
-        raw_stab, corr_stab, "adev", "ADEV",
-        "Allan deviation — TOP vs BOT PPS difference\n"
-        "(differential; common-mode ionosphere/clock cancelled)",
-        out_stem.parent / (out_stem.name + "_pps_adev.png"),
+        curves,
+        ylabel="ADEV  σ_y(τ)  [dimensionless]",
+        title="Allan deviation — individual PPS stability and differential agreement\n"
+              "(chA/chB: absolute stability + TICC noise; A−B: differential, TICC cancels)",
+        out_path=out_stem.parent / (out_stem.name + "_pps_adev.png"),
     )
 
 
-def plot_tdev(raw_stab: dict, corr_stab: dict, out_stem: Path) -> None:
+def plot_tdev(indiv: dict[str, dict], out_stem: Path) -> None:
+    """
+    TDEV plot: all three series raw and corrected.
+    Y axis: σ_x(τ) in nanoseconds.
+    """
+    def _curve(key, label, color, ls):
+        stab = indiv.get(key, {})
+        if stab:
+            return (label, color, ls, stab["taus_tdev"], stab["tdev"] * 1e9)
+        return None
+
+    curves = [c for c in [
+        _curve("chA_raw",  "chA (F10T) raw",        "steelblue", "-"),
+        _curve("chA_corr", "chA (F10T) corrected",   "steelblue", "--"),
+        _curve("chB_raw",  "chB (PX1125T) raw",      "tomato",    "-"),
+        _curve("chB_corr", "chB (PX1125T) corrected","tomato",    "--"),
+        _curve("diff_raw", "A−B raw",                "seagreen",  "-"),
+        _curve("diff_corr","A−B corrected",           "seagreen",  "--"),
+    ] if c is not None]
+
     _stability_plot(
-        raw_stab, corr_stab, "tdev", "TDEV",
-        "Time deviation — TOP vs BOT PPS difference",
-        out_stem.parent / (out_stem.name + "_pps_tdev.png"),
+        curves,
+        ylabel="TDEV  σ_x(τ)  (ns)",
+        title="Time deviation — individual PPS stability and differential agreement",
+        out_path=out_stem.parent / (out_stem.name + "_pps_tdev.png"),
     )
 
 
@@ -589,13 +723,12 @@ def main():
         print(f"  Corr : mean={corr_ns.mean():+.2f} ns  std={corr_ns.std():.2f} ns")
 
     print("Computing ADEV/TDEV …")
-    raw_stab  = compute_stability(df["raw_diff_s"].values)
-    corr_stab = compute_stability(df["corr_diff_s"].values) if timtp else {}
+    indiv = individual_stability(df)
 
-    write_report(df, raw_stab, corr_stab, alignment, out_stem)
+    write_report(df, indiv, alignment, out_stem)
     plot_diff(df, out_stem)
-    plot_adev(raw_stab, corr_stab, out_stem)
-    plot_tdev(raw_stab, corr_stab, out_stem)
+    plot_adev(indiv, out_stem)
+    plot_tdev(indiv, out_stem)
 
     print("Done.")
 

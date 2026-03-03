@@ -62,7 +62,7 @@ def parse_psti00(sentence: str) -> float | None:
         # $PSTI,00,<mode>,<survey_len>,<qerr_ns>,<thresh>,<calc_std>
         if len(parts) < 5 or parts[0] != "PSTI" or parts[1] != "00":
             return None
-        return float(parts[3])
+        return float(parts[4])
     except (ValueError, IndexError):
         return None
 
