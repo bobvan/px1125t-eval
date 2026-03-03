@@ -1,0 +1,23 @@
+# udev rules for timing hardware on onocoy.local
+#
+# Install: sudo cp 99-timing-devices.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger
+
+# TAPR TICC (Arduino Uno CDC, serial 44236313835351B02001)
+# chA = NEO-F10T PPS,  chB = PX1125T PPS
+SUBSYSTEM=="tty", \
+    ATTRS{idVendor}=="2341", \
+    ATTRS{idProduct}=="0042", \
+    ATTRS{serial}=="44236313835351B02001", \
+    SYMLINK+="ttyTICC", \
+    MODE="0666", \
+    TAG+="systemd"
+
+# u-blox NEO-F10T (FTDI FT230X, serial D30GD1PE)
+SUBSYSTEM=="tty", \
+    ATTRS{idVendor}=="0403", \
+    ATTRS{idProduct}=="6015", \
+    ATTRS{serial}=="D30GD1PE", \
+    SYMLINK+="ttyF10T", \
+    MODE="0666", \
+    TAG+="systemd"

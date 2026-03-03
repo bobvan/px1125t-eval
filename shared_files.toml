@@ -22,3 +22,7 @@ source_path = "src/testant/ticc_logger.py"
 local       = "timtp_logger.py"
 source_rig  = "testAnt"
 source_path = "src/testant/timtp_logger.py"
+
+# analyze_pps.py is intentionally FORKED from testAnt — receiver labels
+# and CLI args differ (F10T/PX1125T vs TOP/BOT; --psti added).
+# Do not add it here; it should diverge.
