@@ -141,15 +141,15 @@ def _gps_join(ticc: pd.DataFrame,
     df = ticc.copy()
     df["gps_sec"] = df["integer_sec"] + gps_offset
 
-    top_q  = top_df.set_index("tow_s")["qerr_ps"]
-    bot_q  = bot_df.set_index("tow_s")["qerr_ps"]
-    top_ts = top_df.set_index("tow_s")["timestamp"]
+    top_q  = top_df.set_index("tow_s")["qerr_ps"]   if not top_df.empty else pd.Series(dtype=float)
+    bot_q  = bot_df.set_index("tow_s")["qerr_ps"]   if not bot_df.empty else pd.Series(dtype=float)
+    top_ts = top_df.set_index("tow_s")["timestamp"]  if not top_df.empty else pd.Series(dtype=object)
 
     # tow_s = GPS_second − 1 is the TIM-TP that predicted this PPS edge
     corr_tow = df["gps_sec"] - 1
-    df["qerr_top_ps"] = corr_tow.map(top_q)
-    df["qerr_bot_ps"] = corr_tow.map(bot_q)
-    df["utc_time"]    = corr_tow.map(top_ts)
+    df["qerr_top_ps"] = corr_tow.map(top_q)   if not top_q.empty  else np.nan
+    df["qerr_bot_ps"] = corr_tow.map(bot_q)   if not bot_q.empty  else np.nan
+    df["utc_time"]    = corr_tow.map(top_ts)  if not top_ts.empty else pd.NaT
 
     return df.dropna(subset=["qerr_top_ps", "qerr_bot_ps"]).reset_index(drop=True)
 
@@ -218,6 +218,20 @@ def apply_qerr(ticc: pd.DataFrame,
     """
     top = timtp.get("TOP", pd.DataFrame(columns=["qerr_ps", "tow_s", "timestamp"]))
     bot = timtp.get("BOT", pd.DataFrame(columns=["qerr_ps", "tow_s"]))
+
+    # No qErr available: return raw pairs with synthetic relative time axis.
+    if top.empty and bot.empty:
+        df = ticc.copy()
+        df["corr_diff_s"] = df["raw_diff_s"]
+        df["qerr_top_ps"] = 0
+        df["qerr_bot_ps"] = 0
+        # Synthesise a UTC-like time from integer_sec (arbitrary epoch).
+        t0 = pd.Timestamp("1970-01-01", tz="UTC") + \
+             pd.to_timedelta(df["integer_sec"].iloc[0], unit="s")
+        df["utc_time"] = pd.to_datetime(
+            df["integer_sec"] - df["integer_sec"].iloc[0], unit="s", utc=True
+        ) + t0
+        return df
 
     df = _gps_join(ticc, top, bot, gps_offset)
     df["corr_diff_s"] = (
