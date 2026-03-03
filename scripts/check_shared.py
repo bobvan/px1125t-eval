@@ -55,7 +55,8 @@ def bead_exists(subject_fragment: str) -> bool:
         return False
 
 
-def file_bead(local: str, source_rig: str, source_path: str, dry_run: bool) -> None:
+def file_bead(local: str, source_rig: str, source_path: str,
+              dry_run: bool, gt_root: Path) -> None:
     subject = f"Shared file diverged: {local} vs {source_rig}/{source_path}"
     body = (
         f"The file `{local}` in px1125t_eval has diverged from its source "
@@ -73,12 +74,19 @@ def file_bead(local: str, source_rig: str, source_path: str, dry_run: bool) -> N
     if bead_exists(local):
         print(f"  (bead already open for {local}, skipping)")
         return
-    subprocess.run(
+    # bd needs to run against the rig's beads database, not the source repo.
+    # Discover it via the Gas Town rig clone (gt_root / rig_name / .beads).
+    beads_dir = gt_root / "px1125t_eval" / ".beads"
+    env = {**__import__("os").environ, "BEADS_DIR": str(beads_dir)}
+    result = subprocess.run(
         ["bd", "create", subject, "-t", "task",
          "--description", body],
-        check=False,
+        check=False, env=env, capture_output=True, text=True,
     )
-    print(f"  Bead filed: {subject}")
+    if result.returncode == 0:
+        print(f"  Bead filed: {subject}")
+    else:
+        print(f"  WARNING: bd create failed: {result.stderr.strip()}")
 
 
 def main() -> int:
@@ -115,7 +123,7 @@ def main() -> int:
         if not local_file.exists():
             print(f"  MISSING local  : {local_rel}")
             diverged += 1
-            file_bead(local_rel, source_rig, source_path, args.dry_run)
+            file_bead(local_rel, source_rig, source_path, args.dry_run, gt_root)
             continue
 
         if not source_file.exists():
@@ -131,7 +139,7 @@ def main() -> int:
         else:
             print(f"  DIVERGED {local_rel}  ← {source_rig}/{source_path}")
             diverged += 1
-            file_bead(local_rel, source_rig, source_path, args.dry_run)
+            file_bead(local_rel, source_rig, source_path, args.dry_run, gt_root)
 
     if diverged:
         print(f"\n{diverged} file(s) diverged.")
