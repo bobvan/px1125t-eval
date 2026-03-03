@@ -70,6 +70,11 @@ def load_ticc(path: Path) -> pd.DataFrame:
     """
     Load TICC CSV and pair chA/chB edges by integer second.
 
+    Handles TICC power-cycle resets: the TICC timestamps restart from ~0 after
+    a reset.  If a backward jump > _RESET_THRESHOLD_S is detected in the
+    file-order timestamp sequence, the data is split into sessions and the
+    longest session is used (pre-reset stale buffer bytes are discarded).
+
     Asserts that no edge timestamp is within 100 ns of a second boundary —
     if both channels are > 100 ns clear, and the inter-channel delay is
     < 100 ns (as expected for our setup), they will always share the same
@@ -79,9 +84,25 @@ def load_ticc(path: Path) -> pd.DataFrame:
         integer_sec, chA_ts, chB_ts, raw_diff_s
     Sorted by integer_sec; only seconds where both channels arrived.
     """
-    _BOUNDARY_GUARD_S = 100e-9   # 100 ns minimum distance from integer boundary
+    _BOUNDARY_GUARD_S  = 100e-9   # 100 ns minimum distance from integer boundary
+    _RESET_THRESHOLD_S = 60.0     # backward jump this large means a TICC reset
 
     df = pd.read_csv(path)
+
+    # Detect TICC resets: backward jumps in file-order timestamp sequence.
+    jumps = df["timestamp_s"].diff()
+    reset_rows = jumps[jumps < -_RESET_THRESHOLD_S].index.tolist()
+    if reset_rows:
+        # Split into sessions; keep the longest one.
+        boundaries = [0] + reset_rows + [len(df)]
+        sessions   = [df.iloc[boundaries[i]:boundaries[i+1]].copy()
+                      for i in range(len(boundaries) - 1)]
+        longest    = max(sessions, key=len)
+        n_dropped  = len(df) - len(longest)
+        print(f"  TICC: detected {len(reset_rows)} reset(s); "
+              f"dropped {n_dropped} pre-reset row(s), using {len(longest)} rows.")
+        df = longest.reset_index(drop=True)
+
     df["integer_sec"] = df["timestamp_s"].astype(int)
     frac = df["timestamp_s"] - df["integer_sec"]
     bad  = (frac < _BOUNDARY_GUARD_S) | (frac > 1.0 - _BOUNDARY_GUARD_S)
@@ -219,7 +240,8 @@ def validate_alignment(ticc: pd.DataFrame,
 def apply_qerr(ticc: pd.DataFrame,
                timtp: dict[str, pd.DataFrame],
                gps_offset: int,
-               sign: int = +1) -> pd.DataFrame:
+               sign: int = +1,
+               psti_utc: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Correct TICC timestamps with qErr from TIM-TP using GPS-second join.
 
@@ -230,11 +252,14 @@ def apply_qerr(ticc: pd.DataFrame,
     sign=+1 is the expected convention: positive qErr means the pulse fired
     that many ps early; adding qerr moves the timestamp to the true boundary.
 
+    psti_utc: optional DataFrame with columns [tow_s, timestamp] used to
+    establish real UTC wall-clock time even when qErr correction is skipped.
+
     Adds columns:
         gps_sec                              — GPS second for each pair
         qerr_top_ps, qerr_bot_ps            — corrections applied (ps)
         corr_diff_s                          — qErr-corrected A−B (s)
-        utc_time                             — wall-clock UTC from TOP TIM-TP
+        utc_time                             — wall-clock UTC (GPS or synthetic)
     """
     top = timtp.get("TOP", pd.DataFrame(columns=["qerr_ps", "tow_s", "timestamp"]))
     bot = timtp.get("BOT", pd.DataFrame(columns=["qerr_ps", "tow_s"]))
@@ -248,12 +273,19 @@ def apply_qerr(ticc: pd.DataFrame,
         df["chB_corr_ts"] = df["chB_ts"]
         df["corr_diff_s"] = df["raw_diff_s"]
         df["_sign"] = sign
-        # Synthesise a UTC-like time from integer_sec (arbitrary epoch).
-        t0 = pd.Timestamp("1970-01-01", tz="UTC") + \
-             pd.to_timedelta(df["integer_sec"].iloc[0], unit="s")
-        df["utc_time"] = pd.to_datetime(
-            df["integer_sec"] - df["integer_sec"].iloc[0], unit="s", utc=True
-        ) + t0
+        # UTC time axis: use PSTI GPS timestamps if available, else synthetic.
+        if psti_utc is not None and not psti_utc.empty:
+            # Naive GPS offset from PSTI
+            naive = int(psti_utc["tow_s"].iloc[0]) - int(df["integer_sec"].iloc[0])
+            df["gps_sec"] = df["integer_sec"] + naive
+            ts_map = psti_utc.set_index("tow_s")["timestamp"]
+            df["utc_time"] = df["gps_sec"].map(ts_map)
+            # Forward-fill any gaps (should be rare)
+            df["utc_time"] = pd.to_datetime(df["utc_time"], utc=True)
+            df["utc_time"] = df["utc_time"].ffill().bfill()
+        else:
+            epoch = pd.Timestamp("1970-01-01", tz="UTC")
+            df["utc_time"] = epoch + pd.to_timedelta(df["integer_sec"], unit="s")
         return df
 
     df = _gps_join(ticc, top, bot, gps_offset)
@@ -296,9 +328,15 @@ def individual_stability(df: pd.DataFrame) -> dict[str, dict]:
     'diff_raw', 'diff_corr', each a stability dict from compute_stability()
     (may be empty if data is too short or qErr unavailable).
     """
+    isec = df["integer_sec"].values
+
     def _phase(ts: np.ndarray) -> np.ndarray:
-        """Phase residual relative to ideal 1-Hz cadence."""
-        return ts - ts[0] - np.arange(len(ts))
+        """
+        Phase residual relative to ideal 1-Hz cadence.
+        Uses integer_sec as the time axis so missing seconds (gaps) do not
+        corrupt the phase series with a spurious 1-second step each.
+        """
+        return ts - ts[0] - (isec - isec[0]).astype(float)
 
     chA_raw  = df["chA_ts"].values
     chB_raw  = df["chB_ts"].values
@@ -682,16 +720,18 @@ def main():
             break
 
     if args.psti:
-        print(f"Loading $PSTI : {args.psti}  (PX1125T → chB/BOT)")
+        print(f"Loading $PSTI : {args.psti}  (PX1125T, logged for reference)")
         loaded = load_timtp(Path(args.psti))   # same schema
         for grp in loaded.values():
-            timtp["BOT"] = grp
             print(f"  PX1125T: {len(grp)} rows  "
                   f"qerr [{grp['qerr_ps'].min():+d}, {grp['qerr_ps'].max():+d}] ps")
+            print("  NOTE: $PSTI,00 qErr is uncorrelated with PPS timing (r<0.025).")
+            print("        Logged for reference; NOT applied as a correction.")
+            # Intentionally not added to timtp dict — see bead pe-i03.
             break
 
     if not timtp:
-        print("No qErr sources provided — raw TICC analysis only.")
+        print("No qErr correction applied — raw TICC analysis only.")
 
     print("Validating qErr alignment …")
     alignment = validate_alignment(ticc, timtp)
@@ -713,8 +753,17 @@ def main():
         print(f"  *** ALIGNMENT: GPS offset delta={best_delta:+d}, sign={best_sign:+d} "
               f"(using GPS offset={best_gps_offset}) ***", file=sys.stderr)
 
+    # Build psti_utc: tow_s → timestamp mapping for UTC time axis even in raw-only mode.
+    psti_utc = None
+    if args.psti:
+        _psti_all = load_timtp(Path(args.psti))
+        for _grp in _psti_all.values():
+            psti_utc = _grp[["tow_s", "timestamp"]].copy()
+            break
+
     print("Applying qErr correction …")
-    df = apply_qerr(ticc, timtp, gps_offset=best_gps_offset, sign=best_sign)
+    df = apply_qerr(ticc, timtp, gps_offset=best_gps_offset, sign=best_sign,
+                    psti_utc=psti_utc)
     print(f"  {len(df)} pairs after join (GPS offset={best_gps_offset}, sign={best_sign:+d})")
     raw_ns  = df["raw_diff_s"]  * 1e9
     corr_ns = df["corr_diff_s"] * 1e9
