@@ -1,0 +1,14 @@
+# udev rule for SkyTraq PX1125T timing receiver
+# USB-UART bridge: Silicon Labs CP2102, serial "0001"
+# Creates stable symlink: /dev/ttyPX1125T
+#
+# Install: sudo cp 99-px1125t.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger
+
+SUBSYSTEM=="tty", \
+    ATTRS{idVendor}=="10c4", \
+    ATTRS{idProduct}=="ea60", \
+    ATTRS{serial}=="0001", \
+    SYMLINK+="ttyPX1125T", \
+    MODE="0666", \
+    TAG+="systemd"
