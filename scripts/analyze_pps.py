@@ -28,8 +28,11 @@ Alignment notes:
     So TICC pair i is corrected by qErr[i-1] (shift by 1).
     The first TICC pair has no prior qErr and is dropped.
   - chA (F10T) maps to 'TOP'; chB (PX1125T) maps to 'BOT' internally.
-  - TICC pairs and qErr rows are aligned by GPS second (both 1 Hz).
-    UTC wall-clock times come from the F10T (TOP) TIM-TP timestamps.
+  - Alignment by UTC wall-clock second (preferred): TICC host_timestamp
+    floored to integer second S joins TIM-TP row at utc_s = S-1.
+    This is unambiguous and requires no GPS offset search.
+  - Fallback (old TICC CSVs without host_timestamp): GPS offset arithmetic
+    with ±1 search.  UTC wall-clock from F10T TIM-TP or PSTI timestamps.
 """
 
 import argparse
@@ -104,6 +107,13 @@ def load_ticc(path: Path) -> pd.DataFrame:
         df = longest.reset_index(drop=True)
 
     df["integer_sec"] = df["timestamp_s"].astype(int)
+
+    # host_timestamp: UTC wall-clock captured immediately on serial receipt.
+    # Enables unambiguous UTC-second join with TIM-TP (no GPS offset search).
+    if "host_timestamp" in df.columns:
+        host_ts = pd.to_datetime(df["host_timestamp"], utc=True)
+        df["host_sec"] = (host_ts.astype("int64") // 1_000_000_000).astype(int)
+
     frac = df["timestamp_s"] - df["integer_sec"]
     bad  = (frac < _BOUNDARY_GUARD_S) | (frac > 1.0 - _BOUNDARY_GUARD_S)
     if bad.any():
@@ -123,6 +133,9 @@ def load_ticc(path: Path) -> pd.DataFrame:
           .reset_index(drop=True)
     )
     piv["raw_diff_s"] = piv["chA_ts"] - piv["chB_ts"]
+    if "host_sec" in df.columns:
+        hs_map = df.groupby("integer_sec")["host_sec"].first()
+        piv["host_sec"] = piv["integer_sec"].map(hs_map)
     return piv
 
 
@@ -130,12 +143,15 @@ def load_timtp(path: Path) -> dict[str, pd.DataFrame]:
     """
     Load TIM-TP CSV.  Returns dict keyed by receiver ('TOP', 'BOT'),
     each a DataFrame sorted by timestamp with columns:
-        timestamp, qerr_ps, tow_ms, tow_s, week
+        timestamp, qerr_ps, tow_ms, tow_s, utc_s, week
     tow_s is the integer GPS second (tow_ms // 1000).
+    utc_s is the integer UTC second when the message was logged (for UTC join).
     """
     df = pd.read_csv(path, parse_dates=["timestamp"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df["tow_s"] = (df["tow_ms"] // 1000).astype(int)
+    # utc_s: integer UTC second when message was logged (for UTC-second join).
+    df["utc_s"] = (df["timestamp"].astype("int64") // 1_000_000_000).astype(int)
     return {
         rx: grp.sort_values("timestamp").reset_index(drop=True)
         for rx, grp in df.groupby("receiver")
@@ -191,6 +207,43 @@ def _gps_join(ticc: pd.DataFrame,
     return df.reset_index(drop=True)
 
 
+def _utc_join(ticc: pd.DataFrame,
+              top_df: pd.DataFrame,
+              bot_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join TICC pairs with TIM-TP qErr by UTC wall-clock second.
+
+    TICC host_sec = S  (integer UTC second when edge arrived at host).
+    TIM-TP utc_s  = S−1 (when TIM-TP message was logged; it predicted PPS at S).
+
+    No GPS offset arithmetic; no ±1 search uncertainty.
+    Requires host_timestamp column in TICC CSV (logged since 2026-03-04).
+    """
+    df = ticc.copy()
+    top_q  = top_df.set_index("utc_s")["qerr_ps"]  if not top_df.empty else pd.Series(dtype=float)
+    bot_q  = bot_df.set_index("utc_s")["qerr_ps"]  if not bot_df.empty else pd.Series(dtype=float)
+    top_ts = top_df.set_index("utc_s")["timestamp"] if not top_df.empty else pd.Series(dtype=object)
+    bot_ts = bot_df.set_index("utc_s")["timestamp"] if not bot_df.empty else pd.Series(dtype=object)
+
+    corr_utc = df["host_sec"] - 1   # TIM-TP at S-1 predicts PPS edge at S
+    df["qerr_top_ps"] = corr_utc.map(top_q) if not top_q.empty else 0
+    df["qerr_bot_ps"] = corr_utc.map(bot_q) if not bot_q.empty else 0
+
+    if not top_ts.empty:
+        df["utc_time"] = corr_utc.map(top_ts)
+    elif not bot_ts.empty:
+        df["utc_time"] = corr_utc.map(bot_ts)
+    else:
+        df["utc_time"] = pd.NaT
+
+    drop_cols = []
+    if not top_q.empty: drop_cols.append("qerr_top_ps")
+    if not bot_q.empty: drop_cols.append("qerr_bot_ps")
+    if drop_cols:
+        df = df.dropna(subset=drop_cols)
+    return df.reset_index(drop=True)
+
+
 # ── qErr alignment validation ────────────────────────────────────────── #
 
 def validate_alignment(ticc: pd.DataFrame,
@@ -198,25 +251,39 @@ def validate_alignment(ticc: pd.DataFrame,
     """
     Confirm qErr sign and GPS-second alignment.
 
-    The naive GPS offset (tow_s_first − integer_sec_first) should give the
-    correct join.  We also try deltas of −1, +1, +2 relative to the naive
-    estimate to catch cases where the TICC started 1–2 edges before the
-    TIM-TP logger.
+    When TICC CSV contains host_timestamp (logged since 2026-03-04):
+      Uses direct UTC-second join.  Only sign (+1/-1) is searched.
+      Returns join_method="utc".
 
-    Expected: delta=0 (naive GPS offset), sign=+1
-              (corrected = measured + qerr_ps * 1e-12).
+    Fallback (old data without host_timestamp):
+      GPS offset arithmetic with delta search −1…+2.
+      Expected: delta=0, sign=+1.
+      Returns join_method="gps".
 
-    Returns (raw_std_ns, results, naive_offset) where results is a list of
-    (delta, sign, std_ns, n_pairs) for all 8 combinations.
+    Returns (raw_std_ns, results, naive_offset, join_method)
+      results: list of (delta, sign, std_ns, n_pairs)
     """
     top = timtp.get("TOP", pd.DataFrame(columns=["qerr_ps", "tow_s"]))
     bot = timtp.get("BOT", pd.DataFrame(columns=["qerr_ps", "tow_s"]))
     raw_std_ns = float(ticc["raw_diff_s"].dropna().std() * 1e9)
 
     if top.empty and bot.empty:
-        return raw_std_ns, [], 0
+        return raw_std_ns, [], 0, "gps"
 
-    # GPS offset: prefer TOP (F10T) as reference, fall back to BOT (PX1125T)
+    # UTC join: unambiguous when host_timestamp column is present.
+    ref = top if not top.empty else bot
+    if "host_sec" in ticc.columns and "utc_s" in ref.columns:
+        joined = _utc_join(ticc, top, bot)
+        n = len(joined)
+        results = []
+        for sign in (+1, -1):
+            corr = ((joined["chA_ts"] + sign * joined["qerr_top_ps"] * 1e-12) -
+                    (joined["chB_ts"] + sign * joined["qerr_bot_ps"] * 1e-12))
+            std_ns = float(corr.std() * 1e9) if n > 1 else np.inf
+            results.append((0, sign, std_ns, n))
+        return raw_std_ns, results, 0, "utc"
+
+    # GPS offset fallback: prefer TOP (F10T) as reference.
     if not top.empty:
         naive = int(top["tow_s"].iloc[0]) - int(ticc["integer_sec"].iloc[0])
     else:
@@ -231,8 +298,7 @@ def validate_alignment(ticc: pd.DataFrame,
                     (joined["chB_ts"] + sign * joined["qerr_bot_ps"] * 1e-12))
             std_ns = float(corr.std() * 1e9) if n > 1 else np.inf
             results.append((delta, sign, std_ns, n))
-
-    return raw_std_ns, results, naive
+    return raw_std_ns, results, naive, "gps"
 
 
 # ── qErr correction ──────────────────────────────────────────────────── #
@@ -288,7 +354,13 @@ def apply_qerr(ticc: pd.DataFrame,
             df["utc_time"] = epoch + pd.to_timedelta(df["integer_sec"], unit="s")
         return df
 
-    df = _gps_join(ticc, top, bot, gps_offset)
+    # qErr available: use UTC join when host_timestamp present, else GPS join.
+    use_utc = ("host_sec" in ticc.columns and not top.empty
+               and "utc_s" in top.columns)
+    if use_utc:
+        df = _utc_join(ticc, top, bot)
+    else:
+        df = _gps_join(ticc, top, bot, gps_offset)
     df["chA_corr_ts"] = df["chA_ts"] + sign * df["qerr_top_ps"] * 1e-12
     df["chB_corr_ts"] = df["chB_ts"] + sign * df["qerr_bot_ps"] * 1e-12
     df["corr_diff_s"] = df["chA_corr_ts"] - df["chB_corr_ts"]
@@ -427,22 +499,30 @@ def write_report(df: pd.DataFrame,
     a(f"  qErr     : {'applied' if has_corr else 'not available (raw only)'}")
     a("")
 
-    raw_std_ns, align_results, naive_offset = alignment
+    raw_std_ns, align_results, naive_offset, join_method = alignment
     best = min(align_results, key=lambda x: x[2]) if align_results else None
-    a("── qErr alignment check (GPS offset delta from naive, sign) ──────")
-    a(f"  {'GPS Δ':>6s}  {'Sign':>5s}  {'N pairs':>7s}  {'std (ns)':>10s}")
-    a(f"  {'(raw)':>6s}  {'':>5s}  {'':>7s}  {raw_std_ns:>10.3f}")
-    for delta, sign, std_ns, n_pairs in align_results:
-        tags = []
-        if delta == 0 and sign == +1:
-            tags.append("← naive")
-        if best and delta == best[0] and sign == best[1]:
-            tags.append("← best")
-        tag = "  " + " ".join(tags) if tags else ""
-        a(f"  {delta:>+6d}  {sign:>+5d}  {n_pairs:>7d}  {std_ns:>10.3f}{tag}")
-    if best and (best[0] != 0 or best[1] != +1):
-        a(f"  *** GPS offset delta={best[0]:+d} sign={best[1]:+d} "
-          f"(GPS offset={naive_offset + best[0]}) ***")
+    if join_method == "utc":
+        a("── qErr alignment (UTC host_timestamp join) ─────────────────────")
+        a(f"  Raw std  : {raw_std_ns:.3f} ns")
+        a(f"  {'Sign':>5s}  {'N pairs':>7s}  {'std (ns)':>10s}")
+        for delta, sign, std_ns, n_pairs in align_results:
+            tag = "  ← best" if (best and delta == best[0] and sign == best[1]) else ""
+            a(f"  {sign:>+5d}  {n_pairs:>7d}  {std_ns:>10.3f}{tag}")
+    else:
+        a("── qErr alignment (GPS offset search; no host_timestamp) ─────────")
+        a(f"  Raw std  : {raw_std_ns:.3f} ns")
+        a(f"  {'GPS Δ':>6s}  {'Sign':>5s}  {'N pairs':>7s}  {'std (ns)':>10s}")
+        for delta, sign, std_ns, n_pairs in align_results:
+            tags = []
+            if delta == 0 and sign == +1:
+                tags.append("← naive")
+            if best and delta == best[0] and sign == best[1]:
+                tags.append("← best")
+            tag = "  " + " ".join(tags) if tags else ""
+            a(f"  {delta:>+6d}  {sign:>+5d}  {n_pairs:>7d}  {std_ns:>10.3f}{tag}")
+        if best and (best[0] != 0 or best[1] != +1):
+            a(f"  *** GPS offset delta={best[0]:+d} sign={best[1]:+d} "
+              f"(GPS offset={naive_offset + best[0]}) ***")
     a("")
 
     a("── A−B difference (chA − chB) ───────────────────────────")
@@ -735,23 +815,30 @@ def main():
 
     print("Validating qErr alignment …")
     alignment = validate_alignment(ticc, timtp)
-    raw_std_ns, align_results, naive_offset = alignment
+    raw_std_ns, align_results, naive_offset, join_method = alignment
     best = min(align_results, key=lambda x: x[2]) if align_results else (0, 1, raw_std_ns, 0)
     best_delta, best_sign, best_std, best_n = best
     best_gps_offset = naive_offset + best_delta
-    print(f"  {'GPS Δ':>6s}  {'Sign':>5s}  {'N pairs':>7s}  {'std (ns)':>10s}")
-    print(f"  {'(raw)':>6s}  {'':>5s}  {'':>7s}  {raw_std_ns:>10.3f}")
-    for delta, sign, std_ns, n_pairs in align_results:
-        tags = []
-        if delta == 0 and sign == +1:
-            tags.append("← naive")
-        if delta == best_delta and sign == best_sign:
-            tags.append("← best")
-        tag = "  " + " ".join(tags) if tags else ""
-        print(f"  {delta:>+6d}  {sign:>+5d}  {n_pairs:>7d}  {std_ns:>10.3f}{tag}")
-    if best_delta != 0 or best_sign != +1:
-        print(f"  *** ALIGNMENT: GPS offset delta={best_delta:+d}, sign={best_sign:+d} "
-              f"(using GPS offset={best_gps_offset}) ***", file=sys.stderr)
+    print(f"  Method   : {join_method.upper()} join")
+    print(f"  Raw std  : {raw_std_ns:.3f} ns")
+    if join_method == "utc":
+        print(f"  {'Sign':>5s}  {'N pairs':>7s}  {'std (ns)':>10s}")
+        for delta, sign, std_ns, n_pairs in align_results:
+            tag = "  ← best" if (delta == best_delta and sign == best_sign) else ""
+            print(f"  {sign:>+5d}  {n_pairs:>7d}  {std_ns:>10.3f}{tag}")
+    else:
+        print(f"  {'GPS Δ':>6s}  {'Sign':>5s}  {'N pairs':>7s}  {'std (ns)':>10s}")
+        for delta, sign, std_ns, n_pairs in align_results:
+            tags = []
+            if delta == 0 and sign == +1:
+                tags.append("← naive")
+            if delta == best_delta and sign == best_sign:
+                tags.append("← best")
+            tag = "  " + " ".join(tags) if tags else ""
+            print(f"  {delta:>+6d}  {sign:>+5d}  {n_pairs:>7d}  {std_ns:>10.3f}{tag}")
+        if best_delta != 0 or best_sign != +1:
+            print(f"  *** ALIGNMENT: GPS offset delta={best_delta:+d}, sign={best_sign:+d} "
+                  f"(using GPS offset={best_gps_offset}) ***", file=sys.stderr)
 
     # Build psti_utc: tow_s → timestamp mapping for UTC time axis even in raw-only mode.
     psti_utc = None
