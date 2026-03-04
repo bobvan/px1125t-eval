@@ -61,9 +61,10 @@ def ticc_thread(port: str, logger: TiccLogger, counters: dict) -> None:
     try:
         with Ticc(port) as ticc:
             for ch, ts in ticc:
+                host_ts = datetime.now(tz=timezone.utc)
                 if _stop.is_set():
                     break
-                logger.write(ch, ts)
+                logger.write(ch, ts, host_ts)
                 counters["ticc"] += 1
     except Exception as e:
         print(f"[TICC] Error: {e}", flush=True)
