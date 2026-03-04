@@ -25,7 +25,7 @@ Usage:
         --duration 3600
 
 Output files:
-    <stem>_ticc.csv     timestamp_s, channel
+    <stem>_ticc.csv     host_timestamp, ref_sec, ref_ps, channel
     <stem>_psti.csv     timestamp, receiver, qerr_ps, tow_ms, week
     <stem>_timtp.csv    timestamp, receiver, qerr_ps, tow_ms, week  (if --f10t)
 
@@ -60,11 +60,11 @@ def ticc_thread(port: str, logger: TiccLogger, counters: dict) -> None:
     print(f"[TICC] Opening {port}", flush=True)
     try:
         with Ticc(port) as ticc:
-            for ch, ts in ticc:
+            for ch, ref_sec, ref_ps in ticc:
                 host_ts = datetime.now(tz=timezone.utc)
                 if _stop.is_set():
                     break
-                logger.write(ch, ts, host_ts)
+                logger.write(ch, ref_sec, ref_ps, host_ts)
                 counters["ticc"] += 1
     except Exception as e:
         print(f"[TICC] Error: {e}", flush=True)

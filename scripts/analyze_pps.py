@@ -73,30 +73,48 @@ def load_ticc(path: Path) -> pd.DataFrame:
     """
     Load TICC CSV and pair chA/chB edges by integer second.
 
-    Handles TICC power-cycle resets: the TICC timestamps restart from ~0 after
-    a reset.  If a backward jump > _RESET_THRESHOLD_S is detected in the
-    file-order timestamp sequence, the data is split into sessions and the
-    longest session is used (pre-reset stale buffer bytes are discarded).
+    Handles three CSV format generations:
+      Gen 1: timestamp_s, channel          (legacy float)
+      Gen 2: host_timestamp, timestamp_s, channel  (transitional float)
+      Gen 3: host_timestamp, ref_sec, ref_ps, channel  (current int64)
 
-    Asserts that no edge timestamp is within 100 ns of a second boundary —
-    if both channels are > 100 ns clear, and the inter-channel delay is
-    < 100 ns (as expected for our setup), they will always share the same
-    integer second and the pivot is unambiguous.
+    Also handles TICC power-cycle resets: the TICC timestamps restart from ~0
+    after a reset.  If a backward jump > _RESET_THRESHOLD_S is detected in the
+    file-order sequence, the data is split into sessions and the longest kept.
+
+    All generations produce chA_ref_sec / chA_ref_ps / chB_ref_sec / chB_ref_ps
+    as int64 columns, plus raw_diff_ps (int64) and raw_diff_s (float64).
+
+    Asserts that no edge is within 100 ns of a second boundary.
 
     Returns DataFrame with columns:
-        integer_sec, chA_ts, chB_ts, raw_diff_s
+        integer_sec, chA_ref_sec, chA_ref_ps, chB_ref_sec, chB_ref_ps,
+        raw_diff_ps, raw_diff_s[, host_sec]
     Sorted by integer_sec; only seconds where both channels arrived.
     """
     _BOUNDARY_GUARD_S  = 100e-9   # 100 ns minimum distance from integer boundary
     _RESET_THRESHOLD_S = 60.0     # backward jump this large means a TICC reset
 
     df = pd.read_csv(path)
+    cols = set(df.columns)
+
+    # Detect generation and normalise to ref_sec / ref_ps int64 columns.
+    if "ref_sec" in cols:                      # Gen 3
+        df["ref_sec"] = df["ref_sec"].astype("int64")
+        df["ref_ps"]  = df["ref_ps"].astype("int64")
+        df["integer_sec"] = df["ref_sec"]
+        seq_col = "ref_sec"   # column to use for reset detection
+    else:                                       # Gen 1 or 2 (float timestamp_s)
+        df["integer_sec"] = df["timestamp_s"].astype("int64")
+        df["ref_sec"] = df["integer_sec"]
+        df["ref_ps"]  = ((df["timestamp_s"] - df["integer_sec"]) * 1e12
+                         ).round().astype("int64")
+        seq_col = "timestamp_s"
 
     # Detect TICC resets: backward jumps in file-order timestamp sequence.
-    jumps = df["timestamp_s"].diff()
+    jumps = df[seq_col].diff()
     reset_rows = jumps[jumps < -_RESET_THRESHOLD_S].index.tolist()
     if reset_rows:
-        # Split into sessions; keep the longest one.
         boundaries = [0] + reset_rows + [len(df)]
         sessions   = [df.iloc[boundaries[i]:boundaries[i+1]].copy()
                       for i in range(len(boundaries) - 1)]
@@ -106,33 +124,38 @@ def load_ticc(path: Path) -> pd.DataFrame:
               f"dropped {n_dropped} pre-reset row(s), using {len(longest)} rows.")
         df = longest.reset_index(drop=True)
 
-    df["integer_sec"] = df["timestamp_s"].astype(int)
-
-    # host_timestamp: UTC wall-clock captured immediately on serial receipt.
-    # Enables unambiguous UTC-second join with TIM-TP (no GPS offset search).
-    if "host_timestamp" in df.columns:
+    # host_timestamp → integer UTC second for UTC-join with TIM-TP.
+    if "host_timestamp" in cols:
         host_ts = pd.to_datetime(df["host_timestamp"], utc=True)
         df["host_sec"] = (host_ts.astype("int64") // 1_000_000_000).astype(int)
 
-    frac = df["timestamp_s"] - df["integer_sec"]
-    bad  = (frac < _BOUNDARY_GUARD_S) | (frac > 1.0 - _BOUNDARY_GUARD_S)
+    frac_s = df["ref_ps"] / 1e12
+    bad = (frac_s < _BOUNDARY_GUARD_S) | (frac_s > 1.0 - _BOUNDARY_GUARD_S)
     if bad.any():
         raise ValueError(
             f"TICC: {bad.sum()} edge(s) within {_BOUNDARY_GUARD_S*1e9:.0f} ns "
-            f"of a second boundary — possible straddling artefact:\n"
-            f"{df[bad][['timestamp_s', 'channel']].to_string()}"
+            f"of a second boundary — possible straddling artefact"
         )
 
-    piv = (
-        df.pivot_table(index="integer_sec", columns="channel",
-                       values="timestamp_s", aggfunc="first")
-          .rename(columns={"chA": "chA_ts", "chB": "chB_ts"})
-          .dropna()
-          .reset_index()
-          .sort_values("integer_sec")
-          .reset_index(drop=True)
-    )
-    piv["raw_diff_s"] = piv["chA_ts"] - piv["chB_ts"]
+    piv_sec = (df.pivot_table(index="integer_sec", columns="channel",
+                               values="ref_sec", aggfunc="first")
+                 .rename(columns={"chA": "chA_ref_sec", "chB": "chB_ref_sec"}))
+    piv_ps  = (df.pivot_table(index="integer_sec", columns="channel",
+                               values="ref_ps",  aggfunc="first")
+                 .rename(columns={"chA": "chA_ref_ps",  "chB": "chB_ref_ps"}))
+    piv = (pd.concat([piv_sec, piv_ps], axis=1)
+             .dropna()
+             .reset_index()
+             .sort_values("integer_sec")
+             .reset_index(drop=True))
+    for col in ("chA_ref_sec", "chB_ref_sec", "chA_ref_ps", "chB_ref_ps"):
+        piv[col] = piv[col].astype("int64")
+
+    piv["raw_diff_ps"] = ((piv["chA_ref_sec"] - piv["chB_ref_sec"])
+                          * 1_000_000_000_000
+                          + piv["chA_ref_ps"] - piv["chB_ref_ps"])
+    piv["raw_diff_s"]  = piv["raw_diff_ps"].astype(float) * 1e-12
+
     if "host_sec" in df.columns:
         hs_map = df.groupby("integer_sec")["host_sec"].first()
         piv["host_sec"] = piv["integer_sec"].map(hs_map)
@@ -277,9 +300,9 @@ def validate_alignment(ticc: pd.DataFrame,
         n = len(joined)
         results = []
         for sign in (+1, -1):
-            corr = ((joined["chA_ts"] + sign * joined["qerr_top_ps"] * 1e-12) -
-                    (joined["chB_ts"] + sign * joined["qerr_bot_ps"] * 1e-12))
-            std_ns = float(corr.std() * 1e9) if n > 1 else np.inf
+            corr_ps = (joined["raw_diff_ps"]
+                       + sign * (joined["qerr_top_ps"] - joined["qerr_bot_ps"]))
+            std_ns = float(corr_ps.std() * 1e-3) if n > 1 else np.inf
             results.append((0, sign, std_ns, n))
         return raw_std_ns, results, 0, "utc"
 
@@ -294,9 +317,9 @@ def validate_alignment(ticc: pd.DataFrame,
         joined = _gps_join(ticc, top, bot, naive + delta)
         n = len(joined)
         for sign in (+1, -1):
-            corr = ((joined["chA_ts"] + sign * joined["qerr_top_ps"] * 1e-12) -
-                    (joined["chB_ts"] + sign * joined["qerr_bot_ps"] * 1e-12))
-            std_ns = float(corr.std() * 1e9) if n > 1 else np.inf
+            corr_ps = (joined["raw_diff_ps"]
+                       + sign * (joined["qerr_top_ps"] - joined["qerr_bot_ps"]))
+            std_ns = float(corr_ps.std() * 1e-3) if n > 1 else np.inf
             results.append((delta, sign, std_ns, n))
     return raw_std_ns, results, naive, "gps"
 
@@ -333,11 +356,12 @@ def apply_qerr(ticc: pd.DataFrame,
     # No qErr available: return raw pairs with synthetic relative time axis.
     if top.empty and bot.empty:
         df = ticc.copy()
-        df["qerr_top_ps"] = 0
-        df["qerr_bot_ps"] = 0
-        df["chA_corr_ts"] = df["chA_ts"]
-        df["chB_corr_ts"] = df["chB_ts"]
-        df["corr_diff_s"] = df["raw_diff_s"]
+        df["qerr_top_ps"] = np.int64(0)
+        df["qerr_bot_ps"] = np.int64(0)
+        df["chA_corr_ps"] = df["chA_ref_ps"]
+        df["chB_corr_ps"] = df["chB_ref_ps"]
+        df["corr_diff_ps"] = df["raw_diff_ps"]
+        df["corr_diff_s"]  = df["corr_diff_ps"].astype(float) * 1e-12
         df["_sign"] = sign
         # UTC time axis: use PSTI GPS timestamps if available, else synthetic.
         if psti_utc is not None and not psti_utc.empty:
@@ -361,9 +385,11 @@ def apply_qerr(ticc: pd.DataFrame,
         df = _utc_join(ticc, top, bot)
     else:
         df = _gps_join(ticc, top, bot, gps_offset)
-    df["chA_corr_ts"] = df["chA_ts"] + sign * df["qerr_top_ps"] * 1e-12
-    df["chB_corr_ts"] = df["chB_ts"] + sign * df["qerr_bot_ps"] * 1e-12
-    df["corr_diff_s"] = df["chA_corr_ts"] - df["chB_corr_ts"]
+    df["chA_corr_ps"] = df["chA_ref_ps"] + sign * df["qerr_top_ps"]
+    df["chB_corr_ps"] = df["chB_ref_ps"] + sign * df["qerr_bot_ps"]
+    df["corr_diff_ps"] = (df["raw_diff_ps"]
+                          + sign * (df["qerr_top_ps"] - df["qerr_bot_ps"]))
+    df["corr_diff_s"]  = df["corr_diff_ps"].astype(float) * 1e-12
     df["_sign"] = sign   # carry sign through for reporting
     return df
 
@@ -391,35 +417,24 @@ def individual_stability(df: pd.DataFrame) -> dict[str, dict]:
     """
     Compute ADEV/TDEV for each PPS channel individually and for the difference.
 
-    Individual phase series:  x[i] = ts[i] - ts[0] - i
-      (deviation from ideal integer-second cadence, anchored at the first edge)
-    The TICC clock's linear drift cancels out in the A-B difference;
-    it appears in both individual series but is common-mode.
+    Individual phase series: x[i] = (ref_ps[i] - ref_ps[0]) * 1e-12 seconds.
+    The integer-second parts cancel exactly (ref_sec[i] - ref_sec[i-1] ≈ 1,
+    gaps handled because the per-epoch phase is relative to the first epoch).
+    The TICC clock's linear drift is common-mode in the A-B difference.
 
     Returns dict with keys 'chA_raw', 'chA_corr', 'chB_raw', 'chB_corr',
     'diff_raw', 'diff_corr', each a stability dict from compute_stability()
     (may be empty if data is too short or qErr unavailable).
     """
-    isec = df["integer_sec"].values
-
-    def _phase(ts: np.ndarray) -> np.ndarray:
-        """
-        Phase residual relative to ideal 1-Hz cadence.
-        Uses integer_sec as the time axis so missing seconds (gaps) do not
-        corrupt the phase series with a spurious 1-second step each.
-        """
-        return ts - ts[0] - (isec - isec[0]).astype(float)
-
-    chA_raw  = df["chA_ts"].values
-    chB_raw  = df["chB_ts"].values
-    chA_corr = df["chA_corr_ts"].values
-    chB_corr = df["chB_corr_ts"].values
+    def _phase_ps(ps_arr: np.ndarray) -> np.ndarray:
+        """Phase residual from int64 ps array, returned as float seconds."""
+        return (ps_arr - ps_arr[0]).astype(float) * 1e-12
 
     return {
-        "chA_raw":  compute_stability(_phase(chA_raw)),
-        "chA_corr": compute_stability(_phase(chA_corr)),
-        "chB_raw":  compute_stability(_phase(chB_raw)),
-        "chB_corr": compute_stability(_phase(chB_corr)),
+        "chA_raw":  compute_stability(_phase_ps(df["chA_ref_ps"].values)),
+        "chA_corr": compute_stability(_phase_ps(df["chA_corr_ps"].values)),
+        "chB_raw":  compute_stability(_phase_ps(df["chB_ref_ps"].values)),
+        "chB_corr": compute_stability(_phase_ps(df["chB_corr_ps"].values)),
         "diff_raw":  compute_stability(df["raw_diff_s"].values),
         "diff_corr": compute_stability(df["corr_diff_s"].values),
     }
