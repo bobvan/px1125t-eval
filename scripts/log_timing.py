@@ -77,21 +77,19 @@ def psti_thread(port: str, logger: PstiLogger, counters: dict) -> None:
     try:
         with serial.Serial(port, 115200, timeout=2) as ser:
             ser.reset_input_buffer()
-            current_utc: datetime | None = None
-
             while not _stop.is_set():
                 raw = ser.readline()
                 if not raw:
                     continue
                 line = raw.decode("ascii", errors="replace").strip()
 
-                if line.startswith("$GNZDA") or line.startswith("$GPZDA"):
-                    current_utc = parse_gnzda(line)
-
-                elif line.startswith("$PSTI,00"):
+                if line.startswith("$PSTI,00"):
                     qerr_ns = parse_psti00(line)
-                    if qerr_ns is not None and current_utc is not None:
-                        logger.write(current_utc, qerr_ns)
+                    if qerr_ns is not None:
+                        # Use host wall-clock at moment of receipt, same as
+                        # F10T TIM-TP, so utc_s joins correctly with TICC host_sec.
+                        host_ts = datetime.now(tz=timezone.utc)
+                        logger.write(host_ts, qerr_ns)
                         counters["psti"] += 1
 
     except Exception as e:

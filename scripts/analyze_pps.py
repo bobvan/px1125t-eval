@@ -817,14 +817,12 @@ def main():
             break
 
     if args.psti:
-        print(f"Loading $PSTI : {args.psti}  (PX1125T, logged for reference)")
-        loaded = load_timtp(Path(args.psti))   # same schema
+        print(f"Loading $PSTI : {args.psti}  (PX1125T → chB/BOT)")
+        loaded = load_timtp(Path(args.psti))   # same schema as timtp_logger
         for grp in loaded.values():
+            timtp["BOT"] = grp
             print(f"  PX1125T: {len(grp)} rows  "
                   f"qerr [{grp['qerr_ps'].min():+d}, {grp['qerr_ps'].max():+d}] ps")
-            print("  NOTE: $PSTI,00 qErr is uncorrelated with PPS timing (r<0.025).")
-            print("        Logged for reference; NOT applied as a correction.")
-            # Intentionally not added to timtp dict — see bead pe-i03.
             break
 
     if not timtp:
