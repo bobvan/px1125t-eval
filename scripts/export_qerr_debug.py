@@ -2,31 +2,36 @@
 """
 export_qerr_debug.py — Export qErr debug CSV for gnuplot inspection.
 
+pe-rig version: chA = NEO-F10T (--timtp), chB = PX1125T (--psti).
+Both sources are optional; omit either to leave that channel uncorrected.
+
 Outputs one row per aligned epoch with:
-  epoch               sequential integer
-  utc_time            wall-clock UTC (from TOP TIM-TP)
-  qerr_top_ps         raw TIM-TP qErr from TOP receiver (ps)
-  qerr_bot_ps         raw TIM-TP qErr from BOT receiver (ps)
-  qerr_top_smooth_ps  rolling-median of qerr_top (--smooth epochs)
-  qerr_bot_smooth_ps  rolling-median of qerr_bot
-  qerr_diff_ps        qerr_top - qerr_bot  (what the correction actually subtracts)
-  ticc_interval_a_ps  chA PPS interval deviation from 1 s, in ps
-  ticc_interval_b_ps  chB PPS interval deviation from 1 s, in ps
-  ticc_cumphase_a_ps  cumulative phase walk from chA intervals (ps) — anticipated sawtooth
-  ticc_cumphase_b_ps  cumulative phase walk from chB intervals (ps) — anticipated sawtooth
+  epoch                    sequential integer
+  utc_time                 wall-clock UTC (from F10T TIM-TP, or PSTI if absent)
+  qerr_top_ps              raw F10T TIM-TP qErr (ps)       — chA
+  qerr_bot_ps              raw PX1125T $PSTI,00 qErr (ps)  — chB (clamped at ±4200 ps)
+  qerr_top_smooth_ps       rolling-median of qerr_top (--smooth epochs)
+  qerr_bot_smooth_ps       rolling-median of qerr_bot
+  qerr_diff_ps             qerr_top − qerr_bot
+  ticc_interval_a_ps       chA PPS interval deviation from 1 s (ps)
+  ticc_interval_b_ps       chB PPS interval deviation from 1 s (ps)
+                           ← retrospective "true qErr" for PX1125T;
+                             compare against qerr_bot_ps to see clamping
+  ticc_cumphase_a_ps       cumulative phase walk from chA intervals (ps)
+  ticc_cumphase_b_ps       cumulative phase walk from chB intervals (ps)
   ticc_cumphase_smooth_a_ps  long-window smooth of cumphase_a (--long-smooth epochs)
   ticc_cumphase_smooth_b_ps  long-window smooth of cumphase_b
-  raw_diff_ns         raw chA − chB TICC difference (ns)
+  raw_diff_ns              raw chA − chB TICC difference (ns)
 
-The TICC cumulative phase walk is computed from consecutive PPS interval
-deviations: (chA[n] - chA[n-1] - 1.0) * 1e12 ps, summed.  This is an
-independent (receiver-agnostic) view of oscillator phase walk that should
-track each receiver's qErr sawtooth if the correction is working correctly.
+ticc_interval_b_ps is the per-epoch PPS interval deviation of chB (PX1125T).
+It represents what $PSTI,00 qErr should report if unclamped — plotting both
+reveals the ±4200 ps saturation limit of the SkyTraq firmware.
 
 Usage:
     python scripts/export_qerr_debug.py \\
         --ticc  data/foo_ticc.csv  \\
-        --timtp data/foo_timtp.csv \\
+        --timtp data/foo_timtp.csv \\   # F10T TIM-TP  (chA)
+        --psti  data/foo_psti.csv  \\   # PX1125T PSTI (chB)
         --out   data/foo_qerr_debug.csv \\
         [--smooth 300] [--long-smooth 1200]
 """
@@ -121,47 +126,70 @@ def gps_join(ticc: pd.DataFrame,
              top_df: pd.DataFrame,
              bot_df: pd.DataFrame,
              gps_offset: int) -> pd.DataFrame:
-    """GPS-second join fallback (for TICC CSV without host_timestamp)."""
+    """GPS-second join fallback (for TICC CSV without host_timestamp).
+    bot_df may be empty; rows are only dropped for sources that are present."""
     df = ticc.copy()
     df["gps_sec"] = df["integer_sec"] + gps_offset
-
-    top_q  = top_df.set_index("tow_s")["qerr_ps"]
-    bot_q  = bot_df.set_index("tow_s")["qerr_ps"]
-    top_ts = top_df.set_index("tow_s")["timestamp"]
-
     corr_tow = df["gps_sec"] - 1   # TIM-TP at S-1 predicts PPS edge at S
-    df["qerr_top_ps"] = corr_tow.map(top_q)
-    df["qerr_bot_ps"] = corr_tow.map(bot_q)
-    df["utc_time"]    = corr_tow.map(top_ts)
-    return df.dropna(subset=["qerr_top_ps", "qerr_bot_ps"]).reset_index(drop=True)
+
+    top_q  = top_df.set_index("tow_s")["qerr_ps"] if not top_df.empty else pd.Series(dtype=float)
+    bot_q  = bot_df.set_index("tow_s")["qerr_ps"] if not bot_df.empty else pd.Series(dtype=float)
+    top_ts = top_df.set_index("tow_s")["timestamp"] if not top_df.empty else pd.Series(dtype=object)
+
+    df["qerr_top_ps"] = corr_tow.map(top_q) if not top_q.empty else np.int64(0)
+    df["qerr_bot_ps"] = corr_tow.map(bot_q) if not bot_q.empty else np.int64(0)
+    df["utc_time"]    = corr_tow.map(top_ts) if not top_ts.empty else pd.NaT
+
+    drop_cols = []
+    if not top_q.empty: drop_cols.append("qerr_top_ps")
+    if not bot_q.empty: drop_cols.append("qerr_bot_ps")
+    if drop_cols:
+        df = df.dropna(subset=drop_cols)
+    return df.reset_index(drop=True)
 
 
 def utc_join(ticc: pd.DataFrame,
              top_df: pd.DataFrame,
              bot_df: pd.DataFrame) -> pd.DataFrame:
-    """UTC-second join when host_timestamp column is present (preferred)."""
+    """UTC-second join when host_timestamp column is present (preferred).
+    bot_df may be empty; rows are only dropped for sources that are present."""
     df = ticc.copy()
-    top_q  = top_df.set_index("utc_s")["qerr_ps"]
-    bot_q  = bot_df.set_index("utc_s")["qerr_ps"]
-    top_ts = top_df.set_index("utc_s")["timestamp"]
-
     corr_utc = df["host_sec"] - 1
-    df["qerr_top_ps"] = corr_utc.map(top_q)
-    df["qerr_bot_ps"] = corr_utc.map(bot_q)
-    df["utc_time"]    = corr_utc.map(top_ts)
-    return df.dropna(subset=["qerr_top_ps", "qerr_bot_ps"]).reset_index(drop=True)
+
+    top_q  = top_df.set_index("utc_s")["qerr_ps"]  if not top_df.empty else pd.Series(dtype=float)
+    bot_q  = bot_df.set_index("utc_s")["qerr_ps"]  if not bot_df.empty else pd.Series(dtype=float)
+    top_ts = top_df.set_index("utc_s")["timestamp"] if not top_df.empty else pd.Series(dtype=object)
+    bot_ts = bot_df.set_index("utc_s")["timestamp"] if not bot_df.empty else pd.Series(dtype=object)
+
+    df["qerr_top_ps"] = corr_utc.map(top_q) if not top_q.empty else np.int64(0)
+    df["qerr_bot_ps"] = corr_utc.map(bot_q) if not bot_q.empty else np.int64(0)
+    if not top_ts.empty:
+        df["utc_time"] = corr_utc.map(top_ts)
+    elif not bot_ts.empty:
+        df["utc_time"] = corr_utc.map(bot_ts)
+    else:
+        df["utc_time"] = pd.NaT
+
+    drop_cols = []
+    if not top_q.empty: drop_cols.append("qerr_top_ps")
+    if not bot_q.empty: drop_cols.append("qerr_bot_ps")
+    if drop_cols:
+        df = df.dropna(subset=drop_cols)
+    return df.reset_index(drop=True)
 
 
 def best_gps_offset(ticc: pd.DataFrame,
-                    timtp: dict[str, pd.DataFrame]) -> tuple[int, int]:
+                    top: pd.DataFrame,
+                    bot: pd.DataFrame) -> tuple[int, int]:
     """
     Return (gps_offset, sign) that minimises corrected-diff std.
     Uses UTC join when host_timestamp present; GPS offset search otherwise.
     """
-    top = timtp["TOP"]
-    bot = timtp["BOT"]
+    ref = top if not top.empty else bot
+    if ref.empty:
+        return 0, +1
 
-    if "host_sec" in ticc.columns and "utc_s" in top.columns:
+    if "host_sec" in ticc.columns and "utc_s" in ref.columns:
         joined = utc_join(ticc, top, bot)
         best_std = np.inf
         best_sign = +1
@@ -174,7 +202,7 @@ def best_gps_offset(ticc: pd.DataFrame,
                 best_sign = sign
         return 0, best_sign   # offset unused by utc_join, 0 is a sentinel
 
-    naive = int(top["tow_s"].iloc[0]) - int(ticc["integer_sec"].iloc[0])
+    naive = int(ref["tow_s"].iloc[0]) - int(ticc["integer_sec"].iloc[0])
     best_std = np.inf
     best_offset, best_sign = naive, +1
 
@@ -228,12 +256,19 @@ def cumulative_phase(ref_sec: np.ndarray, ref_ps: np.ndarray,
 
 # ── main ─────────────────────────────────────────────────────────────────── #
 
+_EMPTY = pd.DataFrame(columns=["qerr_ps", "tow_s", "utc_s", "timestamp"])
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Export qErr debug CSV for gnuplot inspection"
+        description="Export qErr debug CSV for gnuplot inspection (pe rig)"
     )
-    ap.add_argument("--ticc",        required=True, help="_ticc.csv input")
-    ap.add_argument("--timtp",       required=True, help="_timtp.csv input")
+    ap.add_argument("--ticc",        required=True,
+                    help="_ticc.csv input")
+    ap.add_argument("--timtp",       default=None,
+                    help="_timtp.csv from F10T (chA/TOP); optional")
+    ap.add_argument("--psti",        default=None,
+                    help="_psti.csv from PX1125T (chB/BOT); optional")
     ap.add_argument("--out",         required=True, help="Output .csv path")
     ap.add_argument("--smooth",      type=int, default=300,
                     help="Rolling-median window for qErr smoothing (epochs, default 300)")
@@ -245,20 +280,41 @@ def main():
     ticc = load_ticc(Path(args.ticc))
     print(f"  {len(ticc)} paired epochs")
 
-    print(f"Loading TIM-TP: {args.timtp}")
-    timtp = load_timtp(Path(args.timtp))
-    for rx, grp in timtp.items():
-        print(f"  {rx}: {len(grp)} rows  "
-              f"qerr range [{grp['qerr_ps'].min():+d}, {grp['qerr_ps'].max():+d}] ps")
+    # Load and remap to TOP (chA=F10T) / BOT (chB=PX1125T)
+    top = _EMPTY
+    if args.timtp:
+        print(f"Loading TIM-TP: {args.timtp}  (F10T → chA/TOP)")
+        loaded = load_timtp(Path(args.timtp))
+        for grp in loaded.values():
+            top = grp
+            print(f"  F10T: {len(grp)} rows  "
+                  f"qerr [{grp['qerr_ps'].min():+d}, {grp['qerr_ps'].max():+d}] ps")
+            break
 
-    gps_off, sign = best_gps_offset(ticc, timtp)
-    use_utc = "host_sec" in ticc.columns and "utc_s" in timtp["TOP"].columns
+    bot = _EMPTY
+    if args.psti:
+        print(f"Loading $PSTI : {args.psti}  (PX1125T → chB/BOT)")
+        loaded = load_timtp(Path(args.psti))
+        for grp in loaded.values():
+            bot = grp
+            print(f"  PX1125T: {len(grp)} rows  "
+                  f"qerr [{grp['qerr_ps'].min():+d}, {grp['qerr_ps'].max():+d}] ps")
+            break
+
+    if top.empty and bot.empty:
+        print("WARNING: no qErr source provided — outputting TICC-only columns.")
+
+    gps_off, sign = best_gps_offset(ticc, top, bot)
+    use_utc = "host_sec" in ticc.columns and (
+        ("utc_s" in top.columns and not top.empty) or
+        ("utc_s" in bot.columns and not bot.empty)
+    )
     if use_utc:
         print(f"  Best alignment: UTC join, sign={sign:+d}")
-        df = utc_join(ticc, timtp["TOP"], timtp["BOT"])
+        df = utc_join(ticc, top, bot)
     else:
         print(f"  Best alignment: gps_offset={gps_off}, sign={sign:+d}")
-        df = gps_join(ticc, timtp["TOP"], timtp["BOT"], gps_off)
+        df = gps_join(ticc, top, bot, gps_off)
     print(f"  {len(df)} epochs after join")
 
     # qErr smoothing (short window — shows receiver sawtooth)
