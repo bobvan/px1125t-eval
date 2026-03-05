@@ -34,7 +34,8 @@ if (!exists("infile")) infile = "data/px1125t_20260304T171803_qerr_debug.csv"
 # ── terminal ─────────────────────────────────────────────────────────────── #
 set terminal qt size 1400,900 title infile enhanced font "Sans,10"
 set datafile separator ","
-set datafile missing "nan"
+set datafile missing ""
+set datafile columnheaders
 set key outside right top
 
 # ── multiplot layout: top = qErr, bottom = cumulative phase ─────────────── #
@@ -55,7 +56,7 @@ set label 1 "clamp +4200" at graph 0.01, first  4400 tc rgb "#cc4444" font "Sans
 set label 2 "clamp −4200" at graph 0.01, first -4600 tc rgb "#cc4444" font "Sans,9"
 
 plot \
-    infile using 1:($9 == "" ? 1/0 : $9) \
+    infile using 1:(valid($9) ? $9 : 1/0) \
         with lines lw 1 lc rgb "#aaaaaa" title "TICC interval-B (true qErr)", \
     infile using 1:4 \
         with lines lw 1 lc rgb "#4488cc" title "PX1125T reported (raw)", \
@@ -75,13 +76,13 @@ set ylabel "Cumulative phase (ps)"
 set yrange [*:*]
 
 plot \
-    infile using 1:($11 == "" ? 1/0 : $11) \
+    infile using 1:(valid($11) ? $11 : 1/0) \
         with lines lw 1 lc rgb "#aaaaaa" title "TICC cumphase-B (raw)", \
-    infile using 1:($13 == "" ? 1/0 : $13) \
+    infile using 1:(valid($13) ? $13 : 1/0) \
         with lines lw 2 lc rgb "#4488cc" title "TICC cumphase-B (smooth)", \
-    infile using 1:($10 == "" ? 1/0 : $10) \
+    infile using 1:(valid($10) ? $10 : 1/0) \
         with lines lw 1 lc rgb "#ddaa00" title "TICC cumphase-A (raw)", \
-    infile using 1:($12 == "" ? 1/0 : $12) \
+    infile using 1:(valid($12) ? $12 : 1/0) \
         with lines lw 2 lc rgb "#228800" title "TICC cumphase-A (smooth)"
 
 unset multiplot
