@@ -47,6 +47,7 @@ set multiplot layout 2,1 title infile font "Sans,11"
 set xlabel "Epoch"
 set ylabel "qErr (ps)"
 set grid
+set xrange [1000:1150]
 set yrange [*:*]    # auto; clamp lines will anchor visible range implicitly
 
 # Clamp boundary markers
@@ -56,12 +57,12 @@ set label 1 "clamp +4200" at graph 0.01, first  4400 tc rgb "#cc4444" font "Sans
 set label 2 "clamp −4200" at graph 0.01, first -4600 tc rgb "#cc4444" font "Sans,9"
 
 plot \
-    infile using 1:(valid($9) ? $9 : 1/0) \
-        with lines lw 1 lc rgb "#aaaaaa" title "TICC interval-B (true qErr)", \
     infile using 1:4 \
-        with lines lw 1 lc rgb "#4488cc" title "PX1125T reported (raw)", \
+        with lp lw 1 lc rgb "#aaaaaa" title "PX1125T reported (raw)", \
     infile using 1:6 \
-        with lines lw 2 lc rgb "#cc4400" title "PX1125T smoothed (300-ep median)"
+        with lp lw 2 lc rgb "#cc4400" title "PX1125T smoothed (300-ep median)", \
+    infile using 1:9 \
+        with lp lw 2 lc rgb "#228800" title "TICC interval-B (true qErr)"
 
 unset arrow 1
 unset arrow 2
@@ -71,19 +72,15 @@ unset label 2
 # ────────────────────────────────────────────────────────────────────────── #
 # Panel 2: cumulative phase — smooth TICC chB vs F10T-corrected
 # ────────────────────────────────────────────────────────────────────────── #
-set xlabel "Epoch"
-set ylabel "Cumulative phase (ps)"
-set yrange [*:*]
-
-plot \
-    infile using 1:(valid($11) ? $11 : 1/0) \
-        with lines lw 1 lc rgb "#aaaaaa" title "TICC cumphase-B (raw)", \
-    infile using 1:(valid($13) ? $13 : 1/0) \
-        with lines lw 2 lc rgb "#4488cc" title "TICC cumphase-B (smooth)", \
-    infile using 1:(valid($10) ? $10 : 1/0) \
-        with lines lw 1 lc rgb "#ddaa00" title "TICC cumphase-A (raw)", \
-    infile using 1:(valid($12) ? $12 : 1/0) \
-        with lines lw 2 lc rgb "#228800" title "TICC cumphase-A (smooth)"
+#set xlabel "Epoch"
+#set ylabel "Cumulative phase (ps)"
+#set yrange [*:*]
+#
+#plot \
+#    infile using 1:11 with lines lw 1 lc rgb "#aaaaaa" title "TICC cumphase-B (raw)", \
+#    infile using 1:13 with lines lw 2 lc rgb "#4488cc" title "TICC cumphase-B (smooth)", \
+#    infile using 1:10 with lines lw 1 lc rgb "#ddaa00" title "TICC cumphase-A (raw)", \
+#    infile using 1:12 with lines lw 2 lc rgb "#228800" title "TICC cumphase-A (smooth)"
 
 unset multiplot
 pause -1 "Press Enter (or close window) to exit"
