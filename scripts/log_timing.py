@@ -112,6 +112,8 @@ def timtp_thread(port: str, logger: TimtpLogger, counters: dict) -> None:
                     continue
                 if msg is None or msg.identity != "TIM-TP":
                     continue
+                if getattr(msg, "qErrInvalid", 0):
+                    continue
                 utc = datetime.now(tz=timezone.utc)
                 logger.write(
                     timestamp = utc,
