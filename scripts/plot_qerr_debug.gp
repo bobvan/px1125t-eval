@@ -47,7 +47,7 @@ set multiplot layout 2,1 title infile font "Sans,11"
 set xlabel "Epoch"
 set ylabel "qErr (ps)"
 set grid
-set xrange [1000:1150]
+set xrange [1000:1250]
 set yrange [*:*]    # auto; clamp lines will anchor visible range implicitly
 
 # Clamp boundary markers
@@ -61,8 +61,8 @@ plot \
         with lp lw 1 lc rgb "#aaaaaa" title "PX1125T reported (raw)", \
     infile using 1:6 \
         with lp lw 2 lc rgb "#cc4400" title "PX1125T smoothed (300-ep median)", \
-    infile using 1:9 \
-        with lp lw 2 lc rgb "#228800" title "TICC interval-B (true qErr)"
+#    infile using 1:9 \
+#        with lp lw 2 lc rgb "#228800" title "TICC interval-B (true qErr)"
 
 unset arrow 1
 unset arrow 2
