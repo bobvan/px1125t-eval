@@ -14,6 +14,18 @@ short-term stability.
 | u-blox NEO-F10T | chA | `/dev/ttyF10T` | UBX-TIM-TP qErr (reference) |
 | SkyTraq PX1125T | chB | `/dev/ttyPX1125T` | $PSTI,00 qErr (under test) |
 
+## References
+
+- [PX1125T Datasheet (Rev 3, 2024-12-27)](https://navspark.mybigcommerce.com/content/PX1125T_DS.pdf)
+  — SkyTraq's official datasheet.  Section "1PPS Quantization Error" (p.&nbsp;4)
+  and `$PSTI,00` message definition (p.&nbsp;19) are the primary documentation
+  for the qErr feature under evaluation.
+- [GPS-disciplined-OXCO](https://github.com/nsayer/GPS-disciplined-OXCO) — Nick
+  Sayer's open-source GPSDO firmware (Geppetto Electronics).  Successfully uses
+  `$PSTI,00` qErr as a phase correction on the older Venus838LPx-T.  The
+  PX1100T (predecessor to PX1125T) reported qErr&nbsp;=&nbsp;0 consistently,
+  which SkyTraq acknowledged as a bug.
+
 ## Quick start
 
 ```bash
@@ -94,9 +106,8 @@ Produces before/after comparisons showing the effect of qErr correction.
 
 Derives the actual PPS phase offset ("true qErr") from TICC timestamps using
 windowed least-squares drift removal on zero-based timestamps (float64-safe
-within ~1000 s windows).  Compares true qErr against logged receiver values to
-detect clipping.  SkyTraq $PSTI,00 saturates at &plusmn;4200 ps; this script
-reveals whether the actual phase excursions exceed that limit.
+within ~1000 s windows).  Compares the TICC-derived phase offset against logged
+receiver qErr values.
 
 Supports both receivers:
 
@@ -126,8 +137,38 @@ zoom, scroll to scale, `a` to autoscale, `q` to quit.
 - The SkyTraq qErr exhibits a visible sawtooth whose period and direction vary
   across and within captures.  The sawtooth reflects internal receiver clock
   quantization and does not directly track PPS output timing.
-- SkyTraq qErr saturates at &plusmn;4200 ps.  The 16-hour capture (T143235)
-  shows only 1.2% clamping, but the shorter T171803 run shows 46% clamping.
+- SkyTraq qErr spans its full &plusmn;4200&nbsp;ps range, consistent with the
+  &plusmn;4&nbsp;ns bound imposed by the 125&nbsp;MHz PPS generation clock.
+  This is not clipping — the quantization error is physically bounded by the
+  clock period, so the reported values *should* fill this range.
+
+### Datasheet vs observed behaviour
+
+The PX1125T datasheet (p.&nbsp;4) states the 125&nbsp;MHz PPS generation clock
+yields &plusmn;4&nbsp;ns quantization error, and that `$PSTI,00` field&nbsp;4
+reports this error so it "can be used to reduce the effective amount of jitter
+on 1PPS output."  However:
+
+1. **No timing relationship is specified** — the datasheet does not state
+   whether the qErr value describes the PPS that just fired or predicts the
+   next one.  Nick Sayer's Venus838 firmware treats it as "message after PPS
+   describes that PPS," but this is unconfirmed for the PX1125T.
+2. **No sign convention** — positive could mean PPS early or late relative to
+   the ideal UTC edge.  The datasheet is silent.
+3. **Field range contradicts physics** — `$PSTI,00` field&nbsp;4 is documented
+   as &minus;31&nbsp;~&nbsp;+31 (ns), but the 125&nbsp;MHz clock can only
+   produce &plusmn;4&nbsp;ns of quantization error.  The wider documented range
+   may be inherited from older modules with slower clocks, or may reflect
+   additional error sources beyond clock quantization.
+4. **Prior generation was broken** — the PX1100T (predecessor) reported
+   qErr&nbsp;=&nbsp;0 consistently.  SkyTraq acknowledged this as a firmware
+   bug.  The PX1125T reports non-zero values that span the physically expected
+   &plusmn;4&nbsp;ns range, but our TICC measurements show these values
+   correlate with PPS *velocity* (interval deviation), not *phase* (cumulative
+   offset).  A correct sawtooth correction should be a phase quantity.  This
+   suggests the PX1100T's zero-output bug may have been replaced by a different
+   bug — the receiver reports *something*, but not the traditional sawtooth
+   correction that the datasheet implies and that worked on the Venus838.
 
 ## Shared files
 
